@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
@@ -16,6 +17,7 @@ import (
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 	"go.uber.org/zap"
+	"golang.org/x/sync/singleflight"
 )
 
 var (
@@ -23,21 +25,30 @@ var (
 	ErrLockExists = errors.New("lock already exists")
 )
 
+type CacheItem struct {
+	Value    []byte
+	Modified time.Time
+}
+
 type MongoDBStorage struct {
-	URI        string        `json:"uri,omitempty"`
-	Database   string        `json:"database,omitempty"`
-	Collection string        `json:"collection,omitempty"`
-	Timeout    time.Duration `json:"timeout,omitempty"`
-	client     *mongo.Client `json:"-"`
-	logger     *zap.Logger   `json:"-"`
+	URI          string        `json:"uri,omitempty"`
+	Database     string        `json:"database,omitempty"`
+	Collection   string        `json:"collection,omitempty"`
+	Timeout      time.Duration `json:"timeout,omitempty"`
+	client       *mongo.Client `json:"-"`
+	logger       *zap.Logger   `json:"-"`
+	cache        map[string]CacheItem
+	cacheLock    sync.RWMutex
+	cacheTTL     time.Duration
+	requestGroup singleflight.Group // Prevents redundant calls for the same key
 }
 
 func init() {
-	caddy.RegisterModule(MongoDBStorage{})
+	caddy.RegisterModule(&MongoDBStorage{})
 }
 
 // CaddyModule returns the Caddy module information.
-func (MongoDBStorage) CaddyModule() caddy.ModuleInfo {
+func (s *MongoDBStorage) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
 		ID:  "caddy.storage.mongodb",
 		New: func() caddy.Module { return new(MongoDBStorage) },
@@ -45,13 +56,16 @@ func (MongoDBStorage) CaddyModule() caddy.ModuleInfo {
 }
 
 // CertMagicStorage converts the MongoDBStorage to a certmagic.Storage.
-func (s MongoDBStorage) CertMagicStorage() (certmagic.Storage, error) {
+func (s *MongoDBStorage) CertMagicStorage() (certmagic.Storage, error) {
 	return NewStorage(s)
 }
 
 // NewStorage creates a new MongoDBStorage instance and sets up the MongoDB client.
-func NewStorage(c MongoDBStorage) (certmagic.Storage, error) {
-	clientOptions := options.Client().ApplyURI(c.URI)
+func NewStorage(c *MongoDBStorage) (certmagic.Storage, error) {
+	clientOptions := options.Client().
+		ApplyURI(c.URI).
+		SetMaxPoolSize(100) // Enable connection pooling
+
 	mongoCtx, cancel := context.WithTimeout(context.Background(), c.Timeout)
 	defer cancel()
 
@@ -72,7 +86,10 @@ func NewStorage(c MongoDBStorage) (certmagic.Storage, error) {
 		return nil, err
 	}
 
-	return &c, nil
+	c.cache = make(map[string]CacheItem)
+	c.cacheTTL = 10 * time.Minute // Set cache TTL
+
+	return c, nil
 }
 
 // Provision sets up the module.
@@ -152,7 +169,7 @@ func isValidURIScheme(uri string) bool {
 
 // Store puts value at key. It creates the key if it does not exist and overwrites any existing value at this key.
 func (s *MongoDBStorage) Store(ctx context.Context, key string, value []byte) error {
-	s.logger.Info("Storing key", zap.String("key", key))
+	s.logger.Debug("Storing key", zap.String("key", key))
 
 	ctx, cancel := context.WithTimeout(ctx, s.Timeout)
 	defer cancel()
@@ -169,36 +186,64 @@ func (s *MongoDBStorage) Store(ctx context.Context, key string, value []byte) er
 		s.logger.Error("Failed to store key", zap.String("key", key), zap.Error(err))
 		return err
 	}
-	s.logger.Info("Successfully stored key", zap.String("key", key))
+
+	// Update cache asynchronously
+	go func() {
+		s.cacheLock.Lock()
+		defer s.cacheLock.Unlock()
+		s.cache[key] = CacheItem{Value: value, Modified: time.Now()}
+	}()
+
 	return nil
 }
 
-// Load retrieves the value at key.
+// Load retrieves the value at key, using cache if available.
 func (s *MongoDBStorage) Load(ctx context.Context, key string) ([]byte, error) {
-	s.logger.Info("Loading key", zap.String("key", key))
+	s.cacheLock.RLock()
+	item, cached := s.cache[key]
+	s.cacheLock.RUnlock()
 
-	ctx, cancel := context.WithTimeout(ctx, s.Timeout)
-	defer cancel()
-
-	collection := s.client.Database(s.Database).Collection(s.Collection)
-	result := collection.FindOne(ctx, bson.M{"_id": key})
-
-	var doc struct {
-		Value []byte `bson:"value"`
+	if cached && time.Since(item.Modified) < s.cacheTTL {
+		s.logger.Debug("Key loaded from cache", zap.String("key", key))
+		return item.Value, nil
 	}
-	err := result.Decode(&doc)
+
+	// Prevent redundant calls using singleflight
+	val, err, _ := s.requestGroup.Do(key, func() (interface{}, error) {
+		s.logger.Debug("Loading key from MongoDB", zap.String("key", key))
+
+		ctx, cancel := context.WithTimeout(ctx, s.Timeout)
+		defer cancel()
+
+		collection := s.client.Database(s.Database).Collection(s.Collection)
+		result := collection.FindOne(ctx, bson.M{"_id": key})
+
+		var doc struct {
+			Value []byte `bson:"value"`
+		}
+		err := result.Decode(&doc)
+		if err != nil {
+			s.logger.Warn("Key not found", zap.String("key", key))
+			return nil, fs.ErrNotExist
+		}
+
+		// Cache the result
+		s.cacheLock.Lock()
+		s.cache[key] = CacheItem{Value: doc.Value, Modified: time.Now()}
+		s.cacheLock.Unlock()
+
+		return doc.Value, nil
+	})
+
 	if err != nil {
-		s.logger.Warn("Key not found", zap.String("key", key))
-		return nil, fs.ErrNotExist
+		return nil, err
 	}
-
-	s.logger.Info("Successfully loaded key", zap.String("key", key))
-	return doc.Value, nil
+	return val.([]byte), nil
 }
 
-// Delete deletes the named key. If the name is a directory (i.e. prefix of other keys), all keys prefixed by this key should be deleted.
+// Delete deletes the named key and clears the cache.
 func (s *MongoDBStorage) Delete(ctx context.Context, key string) error {
-	s.logger.Info("Deleting key", zap.String("key", key))
+	s.logger.Debug("Deleting key", zap.String("key", key))
 
 	ctx, cancel := context.WithTimeout(ctx, s.Timeout)
 	defer cancel()
@@ -210,13 +255,27 @@ func (s *MongoDBStorage) Delete(ctx context.Context, key string) error {
 		s.logger.Error("Failed to delete key", zap.String("key", key), zap.Error(err))
 		return err
 	}
-	s.logger.Info("Successfully deleted key", zap.String("key", key))
+
+	// Remove from cache
+	s.cacheLock.Lock()
+	defer s.cacheLock.Unlock()
+	delete(s.cache, key)
+
 	return nil
 }
 
-// Exists returns true if the key exists either as a directory (prefix to other keys) or a file, and there was no error checking.
+// Exists returns true if the key exists, checking the cache first.
 func (s *MongoDBStorage) Exists(ctx context.Context, key string) bool {
-	s.logger.Info("Checking existence of key", zap.String("key", key))
+	s.logger.Debug("Checking existence of key", zap.String("key", key))
+
+	s.cacheLock.RLock()
+	_, cached := s.cache[key]
+	s.cacheLock.RUnlock()
+
+	if cached {
+		s.logger.Debug("Key exists in cache", zap.String("key", key))
+		return true
+	}
 
 	ctx, cancel := context.WithTimeout(ctx, s.Timeout)
 	defer cancel()
@@ -230,44 +289,46 @@ func (s *MongoDBStorage) Exists(ctx context.Context, key string) bool {
 	}
 
 	exists := count > 0
-	s.logger.Info("Key existence check result", zap.String("key", key), zap.Bool("exists", exists))
+	s.logger.Debug("Key existence check result", zap.String("key", key), zap.Bool("exists", exists))
 	return exists
 }
 
 // List lists all keys in the given path.
 func (s *MongoDBStorage) List(ctx context.Context, prefix string, recursive bool) ([]string, error) {
-	s.logger.Info("Listing keys", zap.String("prefix", prefix), zap.Bool("recursive", recursive))
+	s.logger.Debug("Listing keys", zap.String("prefix", prefix), zap.Bool("recursive", recursive))
 
 	ctx, cancel := context.WithTimeout(ctx, s.Timeout)
 	defer cancel()
 
 	collection := s.client.Database(s.Database).Collection(s.Collection)
 	filter := bson.M{"_id": bson.M{"$regex": "^" + prefix}}
-	cursor, err := collection.Find(ctx, filter)
+
+	cur, err := collection.Find(ctx, filter)
 	if err != nil {
 		s.logger.Error("Failed to list keys", zap.String("prefix", prefix), zap.Error(err))
 		return nil, err
 	}
-	defer cursor.Close(ctx)
+	defer cur.Close(ctx)
 
 	var keys []string
-	for cursor.Next(ctx) {
+	for cur.Next(ctx) {
 		var doc struct {
-			ID string `bson:"_id"`
+			Key string `bson:"_id"`
 		}
-		if err := cursor.Decode(&doc); err != nil {
+		err := cur.Decode(&doc)
+		if err != nil {
 			s.logger.Error("Failed to decode key", zap.Error(err))
-			return nil, err
+			continue
 		}
-		keys = append(keys, doc.ID)
+		keys = append(keys, doc.Key)
 	}
-	s.logger.Info("Listed keys", zap.Int("count", len(keys)))
+
 	return keys, nil
 }
 
-// Stat returns metadata about a key.
+// Stat returns information about the key.
 func (s *MongoDBStorage) Stat(ctx context.Context, key string) (certmagic.KeyInfo, error) {
-	s.logger.Info("Statting key", zap.String("key", key))
+	s.logger.Debug("Stating key", zap.String("key", key))
 
 	ctx, cancel := context.WithTimeout(ctx, s.Timeout)
 	defer cancel()
@@ -276,81 +337,74 @@ func (s *MongoDBStorage) Stat(ctx context.Context, key string) (certmagic.KeyInf
 	result := collection.FindOne(ctx, bson.M{"_id": key})
 
 	var doc struct {
-		Modified time.Time `bson:"modified"`
 		Value    []byte    `bson:"value"`
+		Modified time.Time `bson:"modified"`
 	}
 	err := result.Decode(&doc)
 	if err != nil {
-		s.logger.Warn("Key not found in Stat", zap.String("key", key))
-		return certmagic.KeyInfo{}, fs.ErrNotExist
+		if errors.Is(err, mongo.ErrNoDocuments) {
+			return certmagic.KeyInfo{}, fs.ErrNotExist
+		}
+		s.logger.Error("Failed to stat key", zap.String("key", key), zap.Error(err))
+		return certmagic.KeyInfo{}, err
 	}
 
-	s.logger.Info("Stat result for key", zap.String("key", key), zap.Time("modified", doc.Modified), zap.Int("size", len(doc.Value)))
-
-	return certmagic.KeyInfo{
+	ki := certmagic.KeyInfo{
 		Key:        key,
-		Modified:   doc.Modified,
 		Size:       int64(len(doc.Value)),
-		IsTerminal: true,
-	}, nil
+		Modified:   doc.Modified,
+		IsTerminal: false,
+	}
+
+	return ki, nil
 }
 
-// Lock locks a key to prevent concurrent modifications.
+// Lock acquires a lock for the given key.
 func (s *MongoDBStorage) Lock(ctx context.Context, key string) error {
-	lockKey := key + ".lock"
-	s.logger.Info("Locking key", zap.String("key", lockKey))
-
-	ctx, cancel := context.WithTimeout(ctx, s.Timeout)
-	defer cancel()
+	s.logger.Debug("Acquiring lock", zap.String("key", key))
 
 	collection := s.client.Database(s.Database).Collection(s.Collection)
 	_, err := collection.InsertOne(ctx, bson.M{
-		"_id":   lockKey,
-		"value": "locked",
+		"_id":     key + ".lock",
+		"created": time.Now(),
 	})
-
 	if err != nil {
 		if mongo.IsDuplicateKeyError(err) {
-			s.logger.Warn("Lock already exists", zap.String("key", lockKey))
 			return ErrLockExists
 		}
-		s.logger.Error("Failed to acquire lock", zap.String("key", lockKey), zap.Error(err))
+		s.logger.Error("Failed to acquire lock", zap.String("key", key), zap.Error(err))
 		return err
 	}
-	s.logger.Info("Successfully locked key", zap.String("key", lockKey))
+
 	return nil
 }
 
-// Unlock unlocks a previously locked key.
+// Unlock releases the lock for the given key.
 func (s *MongoDBStorage) Unlock(ctx context.Context, key string) error {
-	lockKey := key + ".lock"
-	s.logger.Info("Unlocking key", zap.String("key", lockKey))
-
-	ctx, cancel := context.WithTimeout(ctx, s.Timeout)
-	defer cancel()
+	s.logger.Debug("Releasing lock", zap.String("key", key))
 
 	collection := s.client.Database(s.Database).Collection(s.Collection)
-	_, err := collection.DeleteOne(ctx, bson.M{"_id": lockKey})
-
+	_, err := collection.DeleteOne(ctx, bson.M{"_id": key + ".lock"})
 	if err != nil {
-		s.logger.Error("Failed to unlock key", zap.String("key", lockKey), zap.Error(err))
+		s.logger.Error("Failed to release lock", zap.String("key", key), zap.Error(err))
 		return err
 	}
-	s.logger.Info("Successfully unlocked key", zap.String("key", lockKey))
+
 	return nil
 }
 
-// Validate validates that the module has a usable config.
-func (s MongoDBStorage) Validate() error {
-	s.logger.Info("Validate")
+// Cleanup closes the MongoDB client connection.
+func (s *MongoDBStorage) Cleanup() error {
+	s.logger.Info("Cleaning up MongoDB storage")
+
+	ctx, cancel := context.WithTimeout(context.Background(), s.Timeout)
+	defer cancel()
+
+	err := s.client.Disconnect(ctx)
+	if err != nil {
+		s.logger.Error("Failed to disconnect MongoDB client", zap.Error(err))
+		return err
+	}
+
 	return nil
 }
-
-// Interface guards
-var (
-	_ caddy.Module          = (*MongoDBStorage)(nil)
-	_ caddy.Provisioner     = (*MongoDBStorage)(nil)
-	_ caddy.Validator       = (*MongoDBStorage)(nil)
-	_ caddyfile.Unmarshaler = (*MongoDBStorage)(nil)
-	_ certmagic.Storage     = (*MongoDBStorage)(nil)
-)

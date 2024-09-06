@@ -83,3 +83,32 @@ COPY Caddyfile /etc/caddy/Caddyfile
 # Format the Caddyfile
 RUN caddy fmt --overwrite /etc/caddy/Caddyfile
 ```
+
+## Docker - Dockerfile for development and testing
+
+```Dockerfile
+# Version to build
+ARG CADDY_VERSION="2.8.4"
+
+# Build stage
+FROM caddy:${CADDY_VERSION}-builder AS builder
+
+# Add module with xcaddy
+# RUN xcaddy build \
+#     --with github.com/root-sector/caddy-storage-mongodb
+COPY caddy-storage-mongodb /caddy-storage-mongodb
+RUN xcaddy build \
+    --with github.com/root-sector/caddy-storage-mongodb=/caddy-storage-mongodb
+
+# Final stage
+FROM caddy:${CADDY_VERSION}
+
+# Copy the built Caddy binary
+COPY --from=builder /usr/bin/caddy /usr/bin/caddy
+
+# Copy the Caddyfile
+COPY Caddyfile /etc/caddy/Caddyfile
+
+# Format the Caddyfile
+RUN caddy fmt --overwrite /etc/caddy/Caddyfile
+```
