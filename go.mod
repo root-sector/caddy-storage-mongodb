@@ -1,6 +1,6 @@
 module github.com/root-sector/caddy-storage-mongodb
 
-go 1.23.1
+go 1.22.7
 
 require (
 	github.com/caddyserver/caddy/v2 v2.8.4
