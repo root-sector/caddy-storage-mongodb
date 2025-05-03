@@ -38,29 +38,29 @@ type CacheItem struct {
 const (
 	// Lock time-to-live duration
 	lockTTL = 5 * time.Second
-	
+
 	// Delay between attempts to obtain Lock
 	lockPollInterval = 1 * time.Second
-	
+
 	// How frequently the Lock's TTL should be updated
 	lockRefreshInterval = 3 * time.Second
 )
 
 type MongoDBStorage struct {
-	URI                 string        `json:"uri,omitempty"`
-	Database            string        `json:"database,omitempty"`
-	Collection          string        `json:"collection,omitempty"`
-	Timeout            time.Duration `json:"timeout,omitempty"`
-	CacheTTL           time.Duration `json:"cache_ttl,omitempty"`
+	URI                  string        `json:"uri,omitempty"`
+	Database             string        `json:"database,omitempty"`
+	Collection           string        `json:"collection,omitempty"`
+	Timeout              time.Duration `json:"timeout,omitempty"`
+	CacheTTL             time.Duration `json:"cache_ttl,omitempty"`
 	CacheCleanupInterval time.Duration `json:"cache_cleanup_interval,omitempty"`
-	MaxCacheSize        int          `json:"max_cache_size,omitempty"`
-	
+	MaxCacheSize         int           `json:"max_cache_size,omitempty"`
+
 	client       *mongo.Client `json:"-"`
 	logger       *zap.Logger   `json:"-"`
 	cache        map[string]CacheItem
 	cacheLock    sync.RWMutex
 	requestGroup singleflight.Group
-	locks      sync.Map // Track active locks
+	locks        sync.Map // Track active locks
 }
 
 func init() {
@@ -98,20 +98,6 @@ func NewStorage(c *MongoDBStorage) (certmagic.Storage, error) {
 	}
 
 	c.client = client
-
-	// Create TTL index for lock expiry
-	collection := client.Database(c.Database).Collection(c.Collection)
-	
-	// Only create the TTL index, let MongoDB handle _id index
-	indexModel := mongo.IndexModel{
-		Keys: bson.D{{Key: "modified", Value: 1}},
-		Options: options.Index().SetExpireAfterSeconds(int32(c.CacheTTL.Seconds())),
-	}
-	
-	_, err = collection.Indexes().CreateOne(context.Background(), indexModel)
-	if err != nil {
-		return nil, err
-	}
 
 	c.cache = make(map[string]CacheItem)
 	c.CacheTTL = 10 * time.Minute
@@ -346,10 +332,10 @@ func (s *MongoDBStorage) Exists(ctx context.Context, key string) bool {
 // List lists all keys in the given path.
 func (s *MongoDBStorage) List(ctx context.Context, prefix string, recursive bool) ([]string, error) {
 	collection := s.client.Database(s.Database).Collection(s.Collection)
-	
+
 	// Ensure prefix doesn't start with /
 	prefix = strings.TrimPrefix(prefix, "/")
-	
+
 	var filter bson.M
 	if recursive {
 		// For recursive listing, match anything that starts with the prefix
@@ -396,7 +382,7 @@ func (s *MongoDBStorage) List(ctx context.Context, prefix string, recursive bool
 
 	var results []string
 	seen := make(map[string]bool)
-	
+
 	for cursor.Next(ctx) {
 		var doc struct {
 			ID string `bson:"_id"`
@@ -404,7 +390,7 @@ func (s *MongoDBStorage) List(ctx context.Context, prefix string, recursive bool
 		if err := cursor.Decode(&doc); err != nil {
 			return nil, fmt.Errorf("failed to decode document: %v", err)
 		}
-		
+
 		// For non-recursive listing, extract the top-level component
 		if !recursive {
 			parts := strings.Split(doc.ID, "/")
@@ -448,13 +434,13 @@ func (s *MongoDBStorage) Stat(ctx context.Context, key string) (certmagic.KeyInf
 	s.logger.Debug("Stating key", zap.String("key", key))
 
 	collection := s.client.Database(s.Database).Collection(s.Collection)
-	
+
 	var doc struct {
 		Key      string    `bson:"_id"`
 		Value    []byte    `bson:"value"`
 		Modified time.Time `bson:"modified"`
 	}
-	
+
 	err := collection.FindOne(ctx, bson.M{"_id": key}).Decode(&doc)
 	if err != nil {
 		if err == mongo.ErrNoDocuments {
@@ -482,21 +468,21 @@ func (s *MongoDBStorage) Lock(ctx context.Context, key string) error {
 			return ctx.Err()
 		default:
 			collection := s.client.Database(s.Database).Collection(s.Collection)
-			
+
 			// Check if lock exists and is not expired
 			var existingLock struct {
 				Expires time.Time `bson:"expires"`
 			}
 			err := collection.FindOne(ctx, bson.M{
-				"_id": lockKey,
+				"_id":     lockKey,
 				"expires": bson.M{"$gt": time.Now()},
 			}).Decode(&existingLock)
-			
+
 			if err == nil {
 				// Lock exists and is not expired
 				return ErrLockExists
 			}
-			
+
 			if err != mongo.ErrNoDocuments {
 				return err
 			}
@@ -568,20 +554,20 @@ func (s *MongoDBStorage) refreshLock(ctx context.Context, lockKey string) {
 // Unlock releases the lock for the given key
 func (s *MongoDBStorage) Unlock(ctx context.Context, key string) error {
 	s.logger.Debug("Releasing lock", zap.String("key", key))
-	
+
 	lockKey := key + ".lock"
-	
+
 	// Remove from our lock tracking
 	s.locks.Delete(lockKey)
-	
+
 	collection := s.client.Database(s.Database).Collection(s.Collection)
 	_, err := collection.DeleteOne(ctx, bson.M{"_id": lockKey})
-	
+
 	if err != nil {
 		s.logger.Error("Failed to release lock", zap.String("key", key), zap.Error(err))
 		return err
 	}
-	
+
 	return nil
 }
 
@@ -615,22 +601,22 @@ func (s *MongoDBStorage) cleanupCache() {
 		if len(s.cache) > s.MaxCacheSize {
 			// Create a slice of cache items sorted by last modified time
 			items := make([]struct {
-				key     string
+				key      string
 				modified time.Time
 			}, 0, len(s.cache))
-			
+
 			for k, v := range s.cache {
 				items = append(items, struct {
-					key     string
+					key      string
 					modified time.Time
 				}{k, v.Modified})
 			}
-			
+
 			// Sort items by modified time (oldest first)
 			sort.Slice(items, func(i, j int) bool {
 				return items[i].modified.Before(items[j].modified)
 			})
-			
+
 			// Remove oldest items until we're under the limit
 			for i := 0; i < len(items)-s.MaxCacheSize; i++ {
 				delete(s.cache, items[i].key)
@@ -654,22 +640,22 @@ func (s *MongoDBStorage) withRetry(op func() error) error {
 // cleanupExpiredLocks removes expired locks from the database
 func (s *MongoDBStorage) cleanupExpiredLocks(ctx context.Context) error {
 	collection := s.client.Database(s.Database).Collection(s.Collection)
-	
+
 	// Delete all locks that have expired
 	filter := bson.M{
-		"_id": bson.M{"$regex": "\\.lock$"},
+		"_id":     bson.M{"$regex": "\\.lock$"},
 		"expires": bson.M{"$lt": time.Now()},
 	}
-	
+
 	result, err := collection.DeleteMany(ctx, filter)
 	if err != nil {
 		return fmt.Errorf("failed to cleanup expired locks: %v", err)
 	}
-	
+
 	if result.DeletedCount > 0 {
 		s.logger.Debug("Cleaned up expired locks", zap.Int64("count", result.DeletedCount))
 	}
-	
+
 	return nil
 }
 
@@ -705,7 +691,7 @@ func (s *MongoDBStorage) Connect() error {
 	}
 
 	s.client = client
-	
+
 	// Ensure indexes are created
 	if err := s.ensureIndexes(ctx); err != nil {
 		return fmt.Errorf("failed to ensure indexes: %v", err)
@@ -760,4 +746,3 @@ func (s *MongoDBStorage) Disconnect(ctx context.Context) error {
 	}
 	return nil
 }
-
