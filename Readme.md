@@ -18,7 +18,7 @@ MongoDB storage for CertMagic/Caddy TLS data with advanced caching and connectio
 
 Enable MongoDB storage for Caddy by specifying the module configuration in the Caddyfile:
 
-```caddyfile
+````caddyfile
 {
     storage mongodb {
         uri "mongodb://localhost:27017"
@@ -28,9 +28,12 @@ Enable MongoDB storage for Caddy by specifying the module configuration in the C
         cache_ttl "10m"
         cache_cleanup_interval "5m"
         max_cache_size 1000
-    }
-}
-```
+        max_pool_size 100 # Optional: Max MongoDB connections
+        min_pool_size 10  # Optional: Min MongoDB connections
+        max_conn_idle_time 5m # Optional: Max idle time for a connection
+       }
+      }
+      ```
 
 ### Configuration Options
 
@@ -43,6 +46,9 @@ Enable MongoDB storage for Caddy by specifying the module configuration in the C
 | cache_ttl              | Cache entry lifetime           | 10m     | No       |
 | cache_cleanup_interval | Interval for cache cleanup     | 5m      | No       |
 | max_cache_size         | Maximum number of cached items | 1000    | No       |
+| max_pool_size          | Max connections in pool        | 100     | No       |
+| min_pool_size          | Min connections in pool        | 0       | No       |
+| max_conn_idle_time     | Max connection idle time       | 5m      | No       |
 
 ## JSON Configuration
 
@@ -56,10 +62,13 @@ Enable MongoDB storage for Caddy by specifying the module configuration in the C
     "timeout": "10s",
     "cache_ttl": "10m",
     "cache_cleanup_interval": "5m",
-    "max_cache_size": 1000
+    "max_cache_size": 1000,
+    "max_pool_size": 100,
+    "min_pool_size": 10,
+    "max_conn_idle_time": "5m"
+   }
   }
-}
-```
+````
 
 ## Environment Variables
 
@@ -70,6 +79,10 @@ MONGODB_URI=mongodb://localhost:27017
 MONGODB_DATABASE=caddy
 MONGODB_COLLECTION=certificates
 MONGODB_TIMEOUT=10s
+# Optional Pool Settings
+MONGODB_MAX_POOL_SIZE=100
+MONGODB_MIN_POOL_SIZE=10
+MONGODB_MAX_CONN_IDLE_TIME=5m
 ```
 
 ## Building with xcaddy
