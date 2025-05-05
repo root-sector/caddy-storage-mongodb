@@ -31,9 +31,9 @@ Enable MongoDB storage for Caddy by specifying the module configuration in the C
         max_pool_size 100 # Optional: Max MongoDB connections
         min_pool_size 10  # Optional: Min MongoDB connections
         max_conn_idle_time 5m # Optional: Max idle time for a connection
-       }
-      }
-      ```
+    }
+}
+```
 
 ### Configuration Options
 
