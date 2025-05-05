@@ -674,9 +674,9 @@ func (s *MongoDBStorage) refreshLock(refreshCtx context.Context, key string, exp
 				// Clean up local tracking as we no longer hold the lock
 				s.locks.Delete(key)
 				return // Stop the refresh goroutine
-			} else {
-				s.logger.Debug("Lock refreshed successfully", zap.String("key", key), zap.String("lockID", expectedLockID), zap.Time("newExpires", newExpires))
 			}
+			// Removed noisy debug log for successful refresh:
+			// s.logger.Debug("Lock refreshed successfully", zap.String("key", key), zap.String("lockID", expectedLockID), zap.Time("newExpires", newExpires))
 
 		case <-refreshCtx.Done():
 			s.logger.Debug("Lock refresh routine cancelled", zap.String("key", key), zap.String("lockID", expectedLockID))
