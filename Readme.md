@@ -51,21 +51,24 @@ Enable MongoDB storage for Caddy by specifying the module configuration in the C
 
 ### Configuration Options
 
-| Option              | Description                    | Default | Required |
-| ------------------- | ------------------------------ | ------- | -------- |
-| uri                 | MongoDB connection string      | -       | Yes      |
-| database            | Database name                  | -       | Yes      |
-| collection          | Collection name                | -       | Yes      |
-| locks_collection    | Locks Collection name          | `locks` | No       |
-| timeout             | Operation timeout              | 10s     | No       |
-| cache_ttl           | Cache entry lifetime           | 10m     | No       |
-| max_cache_entries   | Maximum number of cached items | 1000    | No       |
-| max_pool_size       | Max connections in pool        | 100     | No       |
-| min_pool_size       | Min connections in pool        | 0       | No       |
-| max_conn_idle_time  | Max connection idle time       | 5m      | No       |
-| enable_bulk_writes  | Group Store() calls            | false   | No       |
-| bulk_max_ops        | Max ops per bulk batch         | 100     | No       |
-| bulk_flush_interval | Flush window for bulk writes   | 500ms   | No       |
+| Option              | Description                    | Default                        | Required |
+| ------------------- | ------------------------------ | ------------------------------ | -------- |
+| uri                 | MongoDB connection string      | -                              | Yes      |
+| database            | Database name                  | -                              | Yes      |
+| collection          | Collection name                | -                              | Yes      |
+| locks_collection    | Locks Collection name          | `locks`                        | No       |
+| timeout             | Operation timeout              | `10s`                          | No       |
+| cache_ttl           | Cache entry lifetime           | `10m`                          | No       |
+| max_cache_entries   | Maximum number of cached items | `1000`                         | No       |
+| max_pool_size       | Max connections in pool        | `100` (driver default)         | No       |
+| min_pool_size       | Min connections in pool        | `0` (driver default)           | No       |
+| max_conn_idle_time  | Max connection idle time       | `0` (driver default, no limit) | No       |
+| enable_bulk_writes  | Group Store() calls            | `false`                        | No       |
+| bulk_max_ops        | Max ops per bulk batch         | `100`                          | No       |
+| bulk_flush_interval | Flush window for bulk writes   | `500ms`                        | No       |
+
+- NOTE: if you operate a replica set you can keep sweep reads off the primary
+  simply by appending `readPreference=secondaryPreferred` to the `uri`.
 
 ## JSON Configuration
 
@@ -95,16 +98,16 @@ Enable MongoDB storage for Caddy by specifying the module configuration in the C
 You can also configure the storage module using environment variables:
 
 ```
-| Variable                     | Purpose                          |
-| ---------------------------- | -------------------------------- |
-| `MONGODB_URI`                | Connection string                |
-| `MONGODB_DATABASE`           | Database name                    |
-| `MONGODB_COLLECTION`         | Cert collection                  |
-| `MONGODB_LOCKS_COLLECTION`   | Lock collection (optional)       |
-| `MONGODB_TIMEOUT`            | Operation timeout (`10s`)        |
-| `MONGODB_MAX_POOL_SIZE`      | Max connections                  |
-| `MONGODB_MIN_POOL_SIZE`      | Min connections                  |
-| `MONGODB_MAX_CONN_IDLE_TIME` | Max idle time (`5m`)             |
+| Variable                     | Purpose                                                  |
+| ---------------------------- | -------------------------------------------------------- |
+| `MONGODB_URI`                | Connection string                                        |
+| `MONGODB_DATABASE`           | Database name                                            |
+| `MONGODB_COLLECTION`         | Cert collection                                          |
+| `MONGODB_LOCKS_COLLECTION`   | Lock collection (optional)                               |
+| `MONGODB_TIMEOUT`            | Operation timeout (defaults to `10s` if not set/invalid) |
+| `MONGODB_MAX_POOL_SIZE`      | Max connections                                          |
+| `MONGODB_MIN_POOL_SIZE`      | Min connections                                          |
+| `MONGODB_MAX_CONN_IDLE_TIME` | Max idle time (driver default is no limit if not set)    |
 ```
 
 ## Building with xcaddy
@@ -197,6 +200,24 @@ The module includes benchmark tests to evaluate the performance of core storage 
 
 Navigate to the module directory (`caddy-storage-mongodb`) and use the standard `go test` command with the `-bench` flag. To avoid running regular tests, you can use `-run="^$"`.
 
+To achieve cleaner benchmark output (suppressing `INFO` and `DEBUG` logs from the storage module itself), you can set the `CADDY_MONGODB_BENCHMARK_LOG_LEVEL` environment variable to `error` or `panic` before running the benchmarks. This feature requires the version of the module that includes this environment variable check.
+
+**Windows (PowerShell):**
+
+```powershell
+$env:CADDY_MONGODB_BENCHMARK_LOG_LEVEL="error"
+go test -run="^$" -bench="."
+# To clear after: Remove-Item Env:CADDY_MONGODB_BENCHMARK_LOG_LEVEL
+```
+
+**Linux/macOS (bash):**
+
+```bash
+CADDY_MONGODB_BENCHMARK_LOG_LEVEL=error go test -run="^$" -bench="."
+```
+
+**Common Benchmark Commands:**
+
 ```bash
 # Run all benchmarks in the package
 # On Windows, ensure the dot for "all benchmarks" is quoted.
@@ -225,39 +246,16 @@ goos: windows
 goarch: amd64
 pkg: github.com/root-sector/caddy-storage-mongodb
 cpu: 12th Gen Intel(R) Core(TM) i7-12700KF
-BenchmarkStore/WithBulkWrites-20                   17560             61743 ns/op
-BenchmarkStore/WithoutBulkWrites-20                 2906            530730 ns/op
-BenchmarkLoad/CacheHit-20                           4809            321834 ns/op
---- BENCH: BenchmarkLoad/CacheHit-20
-    storage_bench_test.go:144: Pre-populating 1000 items for Load benchmark (direct to DB)...
-    storage_bench_test.go:151: Pre-population complete.
-    storage_bench_test.go:154: Warming cache for cache-hit scenario...
-    storage_bench_test.go:160: Cache warmed.
-    storage_bench_test.go:144: Pre-populating 1000 items for Load benchmark (direct to DB)...
-    storage_bench_test.go:151: Pre-population complete.
-    storage_bench_test.go:154: Warming cache for cache-hit scenario...
-    storage_bench_test.go:160: Cache warmed.
-BenchmarkLoad/CacheMiss-20                          3518            335649 ns/op
---- BENCH: BenchmarkLoad/CacheMiss-20
-    storage_bench_test.go:144: Pre-populating 1000 items for Load benchmark (direct to DB)...
-    storage_bench_test.go:151: Pre-population complete.
-    storage_bench_test.go:165: Cache cleared for cache-miss scenario.
-    storage_bench_test.go:144: Pre-populating 1000 items for Load benchmark (direct to DB)...
-    storage_bench_test.go:151: Pre-population complete.
-    storage_bench_test.go:165: Cache cleared for cache-miss scenario.
-BenchmarkList/Recursive-20                           160           7010659 ns/op
---- BENCH: BenchmarkList/Recursive-20
-    storage_bench_test.go:201: Pre-populating 5000 items for List benchmark with prefix 'benchlist/autocert/'...
-    storage_bench_test.go:216: Pre-population complete.
-    storage_bench_test.go:201: Pre-populating 5000 items for List benchmark with prefix 'benchlist/autocert/'...
-    storage_bench_test.go:216: Pre-population complete.
-BenchmarkList/NonRecursive-20                        100          10461232 ns/op
---- BENCH: BenchmarkList/NonRecursive-20
-    storage_bench_test.go:201: Pre-populating 5000 items for List benchmark with prefix 'benchlist/autocert/'...
-    storage_bench_test.go:216: Pre-population complete.
-BenchmarkList/NonRecursiveSubfolder-20              2655            510945 ns/op
+BenchmarkStore/WithBulkWrites-20                   16597             64680 ns/op
+BenchmarkStore/WithoutBulkWrites-20                 2736            422473 ns/op
+BenchmarkLoad/CacheHit-20                           5421            317896 ns/op
+BenchmarkLoad/CacheMiss-20                          2925            359599 ns/op
+BenchmarkList/Recursive-20                           154           7549510 ns/op
+BenchmarkList/NonRecursive-20                        229           5147897 ns/op
+BenchmarkList/NonRecursiveSubfolder-20              2778            426876 ns/op
+BenchmarkStat-20                                    3358            358434 ns/op
 PASS
-ok      github.com/root-sector/caddy-storage-mongodb    63.248s
+ok      github.com/root-sector/caddy-storage-mongodb    71.759s
 ```
 
 ### Interpreting Benchmark Results

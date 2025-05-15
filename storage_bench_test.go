@@ -261,3 +261,38 @@ func BenchmarkList(b *testing.B) {
 
 	})
 }
+
+func BenchmarkStat(b *testing.B) {
+	ctx := context.Background()
+	s, _, _, cleanup := setupBenchmarkEnv(b, false) // BulkWrites false, not directly relevant for Stat
+	defer cleanup()
+
+	const numItemsToPreload = 1000
+	keys := make([]string, numItemsToPreload)
+	value := []byte("benchmark_stat_value_payload") // Ensure value results in size being stored
+
+	b.Logf("Pre-populating %d items for Stat benchmark...", numItemsToPreload)
+	for i := 0; i < numItemsToPreload; i++ {
+		keys[i] = fmt.Sprintf("benchstatkey_%s_%d", uuid.NewString(), i)
+		// Use directStore to ensure 'size' and 'modified' are set as they would be by Store
+		if err := s.directStore(ctx, keys[i], value); err != nil {
+			b.Fatalf("Failed to directStore pre-load data for Stat benchmark: %v", err)
+		}
+	}
+	b.Logf("Pre-population complete for Stat benchmark.")
+
+	// Stat operation typically doesn't hit the s.cache (which stores full values),
+	// as it fetches specific fields from DB. No cache clearing needed specifically for Stat logic.
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, err := s.Stat(ctx, keys[i%numItemsToPreload])
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				b.Fatalf("Stat failed with fs.ErrNotExist for key %s. Preloading issue?", keys[i%numItemsToPreload])
+			}
+			b.Fatalf("Stat failed for key %s: %v", keys[i%numItemsToPreload], err)
+		}
+	}
+	b.StopTimer()
+}
