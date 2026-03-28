@@ -7,29 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
-
-- Your new feature here.
+## [2.1.3] - 2026-03-28
 
 ### Changed
 
-- Your change here.
-
-### Deprecated
-
-- Your deprecated feature here.
-
-### Removed
-
-- Your removed feature here.
-
-### Fixed
-
-- Your bug fix here.
-
-### Security
-
-- Your security update here.
+- **MongoDB Go Driver v2**: Migrated from deprecated `go.mongodb.org/mongo-driver` (v1.x) to **`go.mongodb.org/mongo-driver/v2`** (v2.5.0). The v1 import path is deprecated by MongoDB; v2 is the supported API going forward.
+  - BSON helpers such as `Binary`, `Regex`, and `DateTime` now live under `go.mongodb.org/mongo-driver/v2/bson` (the separate `bson/primitive` package is not used in v2).
+  - `mongo.Connect` is called with client options only; connection and server selection timeouts continue to be set via `ClientOptions` (`SetConnectTimeout`, `SetServerSelectionTimeout`, etc.).
+  - `UpdateOne` uses `options.UpdateOne()` instead of the v1 `options.Update()` builder.
+- **Index provisioning errors**: Index creation helpers now use `errors.As` with `mongo.CommandError` and `HasErrorCode` where appropriate, so wrapped server errors from the v2 driver are still recognized when indexes already exist or conflict.
 
 ## [2.1.0] - 2025-05-15
 

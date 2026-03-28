@@ -18,11 +18,10 @@ import (
 	"github.com/caddyserver/certmagic"
 	"github.com/dgraph-io/ristretto/v2"
 	"github.com/google/uuid"
-	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/bson/primitive"
-	"go.mongodb.org/mongo-driver/mongo"
-	"go.mongodb.org/mongo-driver/mongo/options"
-	"go.mongodb.org/mongo-driver/mongo/readpref"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
+	"go.mongodb.org/mongo-driver/v2/mongo/readpref"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"golang.org/x/sync/singleflight"
@@ -362,10 +361,6 @@ func (s *MongoDBStorage) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 /* ---------- MongoDB connection & indexes ---------- */
 
 func (s *MongoDBStorage) connect(caddyCtx caddy.Context) error {
-	// Use the standard context.Context from the Caddy context for driver operations
-	driverOperCtx, driverOperCancel := context.WithTimeout(caddyCtx.Context, s.Timeout)
-	defer driverOperCancel()
-
 	opts := options.Client().
 		ApplyURI(s.URI).
 		// SetServerSelectionTimeout is often implicitly handled by ApplyURI based on connectTimeoutMS, etc.
@@ -377,12 +372,11 @@ func (s *MongoDBStorage) connect(caddyCtx caddy.Context) error {
 		SetMaxConnIdleTime(s.MaxConnIdleTime).
 		SetCompressors([]string{"zstd", "snappy"})
 
-	client, err := mongo.Connect(driverOperCtx, opts)
+	client, err := mongo.Connect(opts)
 	if err != nil {
 		return fmt.Errorf("failed to connect to MongoDB: %w", err)
 	}
 
-	// Ping with a new context to ensure it's not cancelled by driverOperCancel if connect was very fast.
 	pingCtx, pingCancel := context.WithTimeout(caddyCtx.Context, s.Timeout)
 	defer pingCancel()
 	if err := client.Ping(pingCtx, readpref.Primary()); err != nil {
@@ -409,6 +403,32 @@ func (s *MongoDBStorage) connect(caddyCtx caddy.Context) error {
 	return nil
 }
 
+func isIgnorableIndexError(err error, indexName string) bool {
+	if err == nil {
+		return false
+	}
+
+	var cmdErr mongo.CommandError
+	if errors.As(err, &cmdErr) {
+		if cmdErr.HasErrorCode(85) || cmdErr.HasErrorCode(86) {
+			return true
+		}
+		if strings.Contains(cmdErr.Error(), "already exists") || strings.Contains(cmdErr.Message, "already exists") {
+			return true
+		}
+	}
+
+	errText := err.Error()
+	if strings.Contains(errText, "already exists") {
+		return true
+	}
+	if indexName != "" && strings.Contains(errText, "Index with name "+indexName+" already exists with different options") {
+		return true
+	}
+
+	return false
+}
+
 func (s *MongoDBStorage) ensureCertIndexes(ctx context.Context) error {
 	col := s.certCol()
 	idxName := "id_mod_idx" // Index for _id and modified
@@ -422,11 +442,7 @@ func (s *MongoDBStorage) ensureCertIndexes(ctx context.Context) error {
 	_, err := col.Indexes().CreateOne(ctx, index)
 	// Gracefully handle "already exists" errors or specific codes
 	if err != nil {
-		if e, ok := err.(mongo.CommandError); ok && (e.Code == 85 || e.Code == 86 || strings.Contains(e.Error(), "already exists with different options") || strings.Contains(e.Error(), "Index with name "+idxName+" already exists with different options")) {
-			s.logger.Warn("certificate index '"+idxName+"' already exists with different options/spec. Manual review might be needed.", zap.String("index_name", idxName), zap.Error(e))
-			return nil // Not a fatal error for provisioning
-		}
-		if strings.Contains(err.Error(), "already exists") {
+		if isIgnorableIndexError(err, idxName) {
 			s.logger.Info("certificate index '"+idxName+"' already exists.", zap.String("index_name", idxName))
 			return nil // Not a fatal error
 		}
@@ -451,12 +467,7 @@ func (s *MongoDBStorage) ensureLockIndexes(ctx context.Context) error {
 	_, err := col.Indexes().CreateMany(ctx, idx)
 	// Handle "already exists" type errors more gracefully for CreateMany
 	if err != nil {
-		if e, ok := err.(mongo.CommandError); ok && (e.Code == 85 || e.Code == 86 || strings.Contains(e.Message, "already exists")) {
-			s.logger.Info("Lock indexes (or some components) already exist or created with different options that are compatible.", zap.Error(e))
-			return nil // Not a fatal error
-		}
-		// Catching general string for "already exists" as a fallback, specific to CreateMany scenarios.
-		if strings.Contains(err.Error(), "already exist") {
+		if isIgnorableIndexError(err, "") {
 			s.logger.Info("Lock indexes (or some components) already exist.")
 			return nil
 		}
@@ -490,7 +501,7 @@ func (s *MongoDBStorage) directStore(ctx context.Context, key string, value []by
 	now := time.Now().UTC()
 	doc := bson.M{
 		"_id":      key,
-		"value":    primitive.Binary{Subtype: 0x00, Data: value},
+		"value":    bson.Binary{Subtype: 0x00, Data: value},
 		"size":     int64(len(value)),
 		"modified": now,
 	}
@@ -498,7 +509,7 @@ func (s *MongoDBStorage) directStore(ctx context.Context, key string, value []by
 		ctx,
 		bson.M{"_id": key},
 		bson.M{"$set": doc},
-		options.Update().SetUpsert(true),
+		options.UpdateOne().SetUpsert(true),
 	)
 	if err == nil {
 		if !s.cache.SetWithTTL(key, value, 1, s.CacheTTL) {
@@ -520,7 +531,7 @@ func (s *MongoDBStorage) Load(ctx context.Context, key string) ([]byte, error) {
 		opCtx, cancel := context.WithTimeout(ctx, s.Timeout)
 		defer cancel()
 		var doc struct {
-			Value primitive.Binary `bson:"value"`
+			Value bson.Binary `bson:"value"`
 		}
 		errDb := s.certCol().FindOne(opCtx, bson.M{"_id": key}, options.FindOne().SetProjection(bson.M{"value": 1})).Decode(&doc)
 		if errDb != nil {
@@ -589,14 +600,14 @@ func (s *MongoDBStorage) List(ctx context.Context, prefix string, recursive bool
 	prefix = strings.TrimPrefix(prefix, "/")
 	originalPrefixForLog := prefix
 	var filter bson.M
-	baseIdFilter := bson.M{"$not": primitive.Regex{Pattern: `\.lock$`, Options: ""}}
+	baseIdFilter := bson.M{"$not": bson.Regex{Pattern: `\.lock$`, Options: ""}}
 	if recursive {
 		if prefix == "" {
 			filter = bson.M{"_id": baseIdFilter}
 		} else {
 			filter = bson.M{"_id": bson.M{
-				"$regex": primitive.Regex{Pattern: "^" + regexp.QuoteMeta(prefix), Options: ""},
-				"$not":   primitive.Regex{Pattern: `\.lock$`, Options: ""},
+				"$regex": bson.Regex{Pattern: "^" + regexp.QuoteMeta(prefix), Options: ""},
+				"$not":   bson.Regex{Pattern: `\.lock$`, Options: ""},
 			}}
 		}
 	} else {
@@ -610,8 +621,8 @@ func (s *MongoDBStorage) List(ctx context.Context, prefix string, recursive bool
 			regexPattern = "^" + regexp.QuoteMeta(prefix) + "[^/]+$"
 		}
 		filter = bson.M{"_id": bson.M{
-			"$regex": primitive.Regex{Pattern: regexPattern, Options: ""},
-			"$not":   primitive.Regex{Pattern: `\.lock$`, Options: ""},
+			"$regex": bson.Regex{Pattern: regexPattern, Options: ""},
+			"$not":   bson.Regex{Pattern: `\.lock$`, Options: ""},
 		}}
 	}
 	s.logger.Debug("listing keys", zap.String("original_prefix", originalPrefixForLog), zap.Bool("recursive", recursive), zap.Any("filter_regex", filter["_id"]))
@@ -649,7 +660,7 @@ func (s *MongoDBStorage) Stat(ctx context.Context, key string) (certmagic.KeyInf
 	}
 	opts := options.FindOne().SetProjection(bson.M{"size": 1, "modified": 1, "_id": 0})
 	if err := s.certCol().FindOne(ctx, bson.M{"_id": key}, opts).Decode(&doc); err != nil {
-		if err == mongo.ErrNoDocuments {
+		if errors.Is(err, mongo.ErrNoDocuments) {
 			return certmagic.KeyInfo{}, fs.ErrNotExist
 		}
 		return certmagic.KeyInfo{}, err
@@ -831,7 +842,7 @@ func (s *MongoDBStorage) enqueueBulk(ctx context.Context, key string, value []by
 		SetFilter(bson.M{"_id": key}).
 		SetUpdate(bson.M{"$set": bson.M{
 			"_id":      key,
-			"value":    primitive.Binary{Subtype: 0x00, Data: value},
+			"value":    bson.Binary{Subtype: 0x00, Data: value},
 			"size":     int64(len(value)),
 			"modified": time.Now().UTC(),
 		}}).
@@ -915,7 +926,7 @@ func (s *MongoDBStorage) flushBulkLocked(ctx context.Context) error {
 				s.logger.Warn("could not parse key or update fields from bulk model for caching", zap.Any("filter", filter), zap.Any("update", update))
 				continue
 			}
-			value, valOk := setFields["value"].(primitive.Binary)
+			value, valOk := setFields["value"].(bson.Binary)
 			if !valOk {
 				s.logger.Warn("could not parse value from bulk model for caching", zap.String("key", key), zap.Any("setFields", setFields))
 				continue

@@ -14,12 +14,12 @@ import (
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/bson/primitive"
-	"go.mongodb.org/mongo-driver/mongo"
-	"go.mongodb.org/mongo-driver/mongo/options"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 	// "go.uber.org/zap" // Not strictly needed here if not using zaptest directly in tests
 	// "go.uber.org/zap/zaptest" // Use if you want to pass a test-specific logger to the module
 )
@@ -86,7 +86,7 @@ func provisionMongoDBStorage(t *testing.T, enableBulkWrites bool) (*MongoDBStora
 
 	tmpCtx, tmpCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer tmpCancel()
-	tmpCli, err := mongo.Connect(tmpCtx, options.Client().ApplyURI(testURI))
+	tmpCli, err := mongo.Connect(options.Client().ApplyURI(testURI))
 	require.NoError(t, err, "Failed to connect to MongoDB for test cleanup")
 
 	err = tmpCli.Database(testDB).Collection(testCertsCollection).Drop(tmpCtx)
@@ -396,6 +396,170 @@ func TestIndexesCreated(t *testing.T) {
 	assert.True(t, pfeAcceptable, "index '"+expectedIndexName+"' should not have a partialFilterExpression or it must be an empty document. Check logs.")
 }
 
+func TestValidate(t *testing.T) {
+	tests := []struct {
+		name    string
+		storage func() *MongoDBStorage
+		wantErr string
+	}{
+		{
+			name: "valid config",
+			storage: func() *MongoDBStorage {
+				return &MongoDBStorage{
+					URI:        "mongodb://localhost:27017",
+					Database:   "caddy",
+					Collection: "certs",
+					Timeout:    time.Second,
+				}
+			},
+		},
+		{
+			name: "missing uri",
+			storage: func() *MongoDBStorage {
+				return &MongoDBStorage{
+					Database:   "caddy",
+					Collection: "certs",
+					Timeout:    time.Second,
+				}
+			},
+			wantErr: "mongodb URI is required",
+		},
+		{
+			name: "negative cache ttl",
+			storage: func() *MongoDBStorage {
+				return &MongoDBStorage{
+					URI:        "mongodb://localhost:27017",
+					Database:   "caddy",
+					Collection: "certs",
+					Timeout:    time.Second,
+					CacheTTL:   -time.Second,
+				}
+			},
+			wantErr: "cache_ttl cannot be negative",
+		},
+		{
+			name: "invalid bulk config",
+			storage: func() *MongoDBStorage {
+				return &MongoDBStorage{
+					URI:              "mongodb://localhost:27017",
+					Database:         "caddy",
+					Collection:       "certs",
+					Timeout:          time.Second,
+					EnableBulkWrites: true,
+					BulkMaxOps:       0,
+				}
+			},
+			wantErr: "bulk_max_ops must be positive",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.storage().Validate()
+			if tt.wantErr == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.wantErr)
+		})
+	}
+}
+
+func TestUnmarshalCaddyfile(t *testing.T) {
+	input := `mongodb {
+		uri mongodb://mongo:27017
+		database caddy
+		collection certs
+		locks_collection locks_custom
+		timeout 15s
+		cache_ttl 5m
+		max_cache_entries 250
+		max_pool_size 20
+		min_pool_size 2
+		max_conn_idle_time 30s
+		enable_bulk_writes true
+		bulk_max_ops 25
+		bulk_flush_interval 250ms
+	}`
+
+	var storage MongoDBStorage
+	d := caddyfile.NewTestDispenser(input)
+	require.NoError(t, storage.UnmarshalCaddyfile(d))
+
+	assert.Equal(t, "mongodb://mongo:27017", storage.URI)
+	assert.Equal(t, "caddy", storage.Database)
+	assert.Equal(t, "certs", storage.Collection)
+	assert.Equal(t, "locks_custom", storage.LocksCollection)
+	assert.Equal(t, 15*time.Second, storage.Timeout)
+	assert.Equal(t, 5*time.Minute, storage.CacheTTL)
+	assert.Equal(t, 250, storage.MaxCacheEntries)
+	assert.EqualValues(t, 20, storage.MaxPoolSize)
+	assert.EqualValues(t, 2, storage.MinPoolSize)
+	assert.Equal(t, 30*time.Second, storage.MaxConnIdleTime)
+	assert.True(t, storage.EnableBulkWrites)
+	assert.Equal(t, 25, storage.BulkMaxOps)
+	assert.Equal(t, 250*time.Millisecond, storage.BulkFlushInterval)
+}
+
+func TestFirstHost(t *testing.T) {
+	tests := []struct {
+		name string
+		uri  string
+		want string
+	}{
+		{name: "srv uri", uri: "mongodb+srv://user:pass@cluster.mongodb.net/db?retryWrites=true", want: "cluster.mongodb.net"},
+		{name: "replica set", uri: "mongodb://user:pass@host1:27017,host2:27017/db", want: "host1:27017"},
+		{name: "no auth", uri: "mongodb://localhost:27017", want: "localhost:27017"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, firstHost(tt.uri))
+		})
+	}
+}
+
+func TestIsIgnorableIndexError(t *testing.T) {
+	tests := []struct {
+		name      string
+		err       error
+		indexName string
+		want      bool
+	}{
+		{
+			name:      "wrapped command error code 85",
+			err:       fmt.Errorf("wrapped: %w", mongo.CommandError{Code: 85, Message: "IndexOptionsConflict"}),
+			indexName: "id_mod_idx",
+			want:      true,
+		},
+		{
+			name:      "wrapped command error message",
+			err:       fmt.Errorf("wrapped: %w", mongo.CommandError{Message: "Index with name id_mod_idx already exists with different options"}),
+			indexName: "id_mod_idx",
+			want:      true,
+		},
+		{
+			name:      "plain already exists error",
+			err:       errors.New("index already exists"),
+			indexName: "id_mod_idx",
+			want:      true,
+		},
+		{
+			name:      "unrelated error",
+			err:       errors.New("network timeout"),
+			indexName: "id_mod_idx",
+			want:      false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, isIgnorableIndexError(tt.err, tt.indexName))
+		})
+	}
+}
+
 // normalizeIndexKeyValue converts MongoDB index key values (1, -1) which might be int32, int64, or float64
 // into a consistent int32 for comparison.
 func normalizeIndexKeyValue(val interface{}) (int32, bool) {
@@ -502,7 +666,7 @@ func TestLockRefresh(t *testing.T) {
 	defer opCancel()
 	err = s.lockCol().FindOne(opCtx, bson.M{"_id": lockKey + ".lock"}).Decode(&lockDoc)
 	require.NoError(t, err, "Lock document not found after acquiring lock")
-	initialExpires, ok := lockDoc["expires"].(primitive.DateTime)
+	initialExpires, ok := lockDoc["expires"].(bson.DateTime)
 	require.True(t, ok, "Lock document 'expires' field is not a DateTime")
 	assert.True(t, initialExpires.Time().After(time.Now()), "Initial lock expiry is not in the future")
 	// s.logger.Debug("Initial expiry", zap.Time("time", initialExpires.Time()))
@@ -514,7 +678,7 @@ func TestLockRefresh(t *testing.T) {
 	defer opCancel2()
 	err = s.lockCol().FindOne(opCtx2, bson.M{"_id": lockKey + ".lock"}).Decode(&refreshedLockDoc)
 	require.NoError(t, err, "Lock document not found after refresh period")
-	refreshedExpires, ok := refreshedLockDoc["expires"].(primitive.DateTime)
+	refreshedExpires, ok := refreshedLockDoc["expires"].(bson.DateTime)
 	require.True(t, ok, "Refreshed lock document 'expires' field is not a DateTime")
 
 	// s.logger.Debug("Refreshed expiry", zap.Time("time", refreshedExpires.Time()))

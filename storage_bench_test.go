@@ -13,7 +13,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
-	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo"
 )
 
 // setupBenchmarkEnv sets up a MongoDB container and a MongoDBStorage instance for benchmarking.
