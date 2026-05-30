@@ -125,7 +125,7 @@ xcaddy build \
 
 ```dockerfile
 # Version to build
-ARG CADDY_VERSION="2.8.4"
+ARG CADDY_VERSION="2.11.3"
 
 # Build stage
 FROM caddy:${CADDY_VERSION}-builder AS builder
@@ -151,7 +151,7 @@ RUN caddy fmt --overwrite /etc/caddy/Caddyfile
 
 ```dockerfile
 # Version to build
-ARG CADDY_VERSION="2.8.4"
+ARG CADDY_VERSION="2.11.3"
 
 # Build stage
 FROM caddy:${CADDY_VERSION}-builder AS builder

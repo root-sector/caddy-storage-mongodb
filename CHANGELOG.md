@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.1.4] - 2026-05-30
+
+### Fixed
+
+- **Lock refresh context propagation**: The lock refresh goroutine now derives its lifetime from the caller's context via `context.WithoutCancel`, so a short-lived request context no longer stops background lock renewal while the lock is held. Refresh operations also use the derived context for timeouts instead of a detached background context, so `Unlock` cancellation still stops renewal promptly.
+
+### Changed
+
+- **Dependency updates**: Caddy v2.11.3, CertMagic v0.25.3, MongoDB Go Driver v2.6.0 (unchanged), Zap v1.28.0, testcontainers-go v0.42.0, and refreshed indirect modules via `go mod tidy`.
+- **Go toolchain**: Minimum Go version raised to 1.26.
+- **Documentation**: Docker build examples in `Readme.md` now reference Caddy 2.11.3; local test MongoDB image pinned to `mongo:8`.
+
 ## [2.1.3] - 2026-03-28
 
 ### Changed

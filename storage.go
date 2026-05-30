@@ -702,7 +702,7 @@ func (s *MongoDBStorage) Lock(ctx context.Context, key string) error {
 		})
 		opCancel()
 		if err == nil {
-			refreshCtx, refreshCancel := context.WithCancel(context.Background())
+			refreshCtx, refreshCancel := context.WithCancel(context.WithoutCancel(ctx))
 			s.locks.Store(key, &lockHandle{
 				lockID:     myID,
 				key:        key,
@@ -723,7 +723,7 @@ func (s *MongoDBStorage) Lock(ctx context.Context, key string) error {
 			if updateErr != nil {
 				s.logger.Error("error trying to steal expired lock", zap.String("key", key), zap.Error(updateErr))
 			} else if res != nil && res.ModifiedCount == 1 {
-				refreshCtx, refreshCancel := context.WithCancel(context.Background())
+				refreshCtx, refreshCancel := context.WithCancel(context.WithoutCancel(ctx))
 				s.locks.Store(key, &lockHandle{
 					lockID:     myID,
 					key:        key,
@@ -766,7 +766,7 @@ func (s *MongoDBStorage) refreshLock(ctx context.Context, originalKey, lockDocID
 	for {
 		select {
 		case <-ticker.C:
-			opCtx, opCancel := context.WithTimeout(context.Background(), s.Timeout)
+			opCtx, opCancel := context.WithTimeout(ctx, s.Timeout)
 			newExp := time.Now().UTC().Add(lockTTL)
 			res, err := s.lockCol().UpdateOne(opCtx,
 				bson.M{"_id": lockDocID, "lock_id": expectedID},
