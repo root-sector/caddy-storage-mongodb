@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.1.6] - 2026-06-09
+
+### Fixed
+
+- **Go module path**: The module now declares `github.com/root-sector/caddy-storage-mongodb/v2`, matching the `v2.x` tag line required by Go semantic import versioning and `xcaddy`.
+
+### Changed
+
+- **Documentation**: Build examples now use the versioned `/v2@v2.1.6` module path and document the release-tag requirement for `v2.x` builds.
+
 ## [2.1.5] - 2026-06-09
 
 ### Changed

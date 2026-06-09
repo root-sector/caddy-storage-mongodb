@@ -1,4 +1,4 @@
-module github.com/root-sector/caddy-storage-mongodb
+module github.com/root-sector/caddy-storage-mongodb/v2
 
 go 1.26
 

@@ -97,7 +97,6 @@ Enable MongoDB storage for Caddy by specifying the module configuration in the C
 
 You can also configure the storage module using environment variables:
 
-```
 | Variable                     | Purpose                                                  |
 | ---------------------------- | -------------------------------------------------------- |
 | `MONGODB_URI`                | Connection string                                        |
@@ -108,7 +107,6 @@ You can also configure the storage module using environment variables:
 | `MONGODB_MAX_POOL_SIZE`      | Max connections                                          |
 | `MONGODB_MIN_POOL_SIZE`      | Min connections                                          |
 | `MONGODB_MAX_CONN_IDLE_TIME` | Max idle time (driver default is no limit if not set)    |
-```
 
 ## Building with xcaddy
 
@@ -116,8 +114,13 @@ To build Caddy with the MongoDB storage module:
 
 ```bash
 xcaddy build \
-    --with github.com/root-sector/caddy-storage-mongodb
+    --with github.com/root-sector/caddy-storage-mongodb/v2@v2.1.6
 ```
+
+For `v2.x` releases, Go semantic import versioning requires the module path to
+include `/v2` in both `go.mod` and the `xcaddy --with` argument. Create release
+tags only after the tagged commit declares `module github.com/root-sector/caddy-storage-mongodb/v2`;
+otherwise `go get` and `xcaddy` will reject the tag.
 
 ## Docker
 
@@ -125,14 +128,14 @@ xcaddy build \
 
 ```dockerfile
 # Version to build
-ARG CADDY_VERSION="2.11.3"
+ARG CADDY_VERSION="2.11.4"
 
 # Build stage
 FROM caddy:${CADDY_VERSION}-builder AS builder
 
 # Add module with xcaddy
 RUN xcaddy build \
-    --with github.com/root-sector/caddy-storage-mongodb
+    --with github.com/root-sector/caddy-storage-mongodb/v2@v2.1.6
 
 # Final stage
 FROM caddy:${CADDY_VERSION}
@@ -151,7 +154,7 @@ RUN caddy fmt --overwrite /etc/caddy/Caddyfile
 
 ```dockerfile
 # Version to build
-ARG CADDY_VERSION="2.11.3"
+ARG CADDY_VERSION="2.11.4"
 
 # Build stage
 FROM caddy:${CADDY_VERSION}-builder AS builder
@@ -159,7 +162,7 @@ FROM caddy:${CADDY_VERSION}-builder AS builder
 # Add module with xcaddy
 COPY caddy-storage-mongodb /caddy-storage-mongodb
 RUN xcaddy build \
-    --with github.com/root-sector/caddy-storage-mongodb=/caddy-storage-mongodb
+    --with github.com/root-sector/caddy-storage-mongodb/v2=/caddy-storage-mongodb
 
 # Final stage
 FROM caddy:${CADDY_VERSION}
@@ -244,7 +247,7 @@ Here is a sample output from running `go test -run="^$" -bench="."` on a Windows
 ```
 goos: windows
 goarch: amd64
-pkg: github.com/root-sector/caddy-storage-mongodb
+pkg: github.com/root-sector/caddy-storage-mongodb/v2
 cpu: 12th Gen Intel(R) Core(TM) i7-12700KF
 BenchmarkStore/WithBulkWrites-20                   16597             64680 ns/op
 BenchmarkStore/WithoutBulkWrites-20                 2736            422473 ns/op
@@ -255,7 +258,7 @@ BenchmarkList/NonRecursive-20                        229           5147897 ns/op
 BenchmarkList/NonRecursiveSubfolder-20              2778            426876 ns/op
 BenchmarkStat-20                                    3358            358434 ns/op
 PASS
-ok      github.com/root-sector/caddy-storage-mongodb    71.759s
+ok      github.com/root-sector/caddy-storage-mongodb/v2    71.759s
 ```
 
 ### Interpreting Benchmark Results
