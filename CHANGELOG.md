@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.1.5] - 2026-06-09
+
+### Changed
+
+- **Dependency updates**: Caddy v2.11.4, CertMagic v0.25.3, MongoDB Go Driver v2.6.0 (unchanged), Zap v1.28.0, testcontainers-go v0.42.0, `golang.org/x/sync` v0.21.0, and refreshed indirect modules (OpenTelemetry v1.44.0, quic-go v0.60.0, `golang.org/x/crypto` v0.53.0, and related `golang.org/x/*` packages) via `go mod tidy`.
+
 ## [2.1.4] - 2026-05-30
 
 ### Fixed
