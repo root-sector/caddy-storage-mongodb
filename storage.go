@@ -557,15 +557,13 @@ func (s *MongoDBStorage) Load(ctx context.Context, key string) ([]byte, error) {
 func (s *MongoDBStorage) Delete(ctx context.Context, key string) error {
 	opCtx, cancel := context.WithTimeout(ctx, s.Timeout)
 	defer cancel()
-	res, err := s.certCol().DeleteOne(opCtx, bson.M{"_id": key})
+	_, err := s.certCol().DeleteOne(opCtx, bson.M{"_id": key})
 	if err != nil {
 		s.logger.Error("failed to delete item", zap.String("key", key), zap.Error(err))
 		return err
 	}
-	if res.DeletedCount == 0 {
-		s.logger.Debug("attempted to delete non-existent item", zap.String("key", key))
-		return fs.ErrNotExist
-	}
+	// CertMagic deletes empty synthetic directory keys after removing their assets.
+	// A missing exact key is already deleted; also invalidate any stale cached value.
 	s.cache.Del(key)
 	s.logger.Debug("deleted item from db and cache", zap.String("key", key))
 	return nil
@@ -613,12 +611,12 @@ func (s *MongoDBStorage) List(ctx context.Context, prefix string, recursive bool
 	} else {
 		var regexPattern string
 		if prefix == "" {
-			regexPattern = "^[^/]+$"
+			regexPattern = "^[^/]+"
 		} else {
 			if !strings.HasSuffix(prefix, "/") {
 				prefix += "/"
 			}
-			regexPattern = "^" + regexp.QuoteMeta(prefix) + "[^/]+$"
+			regexPattern = "^" + regexp.QuoteMeta(prefix) + "[^/]+"
 		}
 		filter = bson.M{"_id": bson.M{
 			"$regex": bson.Regex{Pattern: regexPattern, Options: ""},
@@ -634,6 +632,7 @@ func (s *MongoDBStorage) List(ctx context.Context, prefix string, recursive bool
 	}
 	defer cur.Close(opCtx)
 	var results []string
+	seen := make(map[string]struct{})
 	for cur.Next(opCtx) {
 		var doc struct {
 			ID string `bson:"_id"`
@@ -642,7 +641,18 @@ func (s *MongoDBStorage) List(ctx context.Context, prefix string, recursive bool
 			s.logger.Error("failed to decode listed key", zap.Error(err))
 			return nil, err
 		}
-		results = append(results, doc.ID)
+		key := doc.ID
+		if !recursive {
+			// Directories are implicit in MongoDB: a deeper stored key contributes
+			// its immediate child prefix, even when no directory marker exists.
+			child, _, _ := strings.Cut(strings.TrimPrefix(key, prefix), "/")
+			key = prefix + child
+			if _, exists := seen[key]; exists {
+				continue
+			}
+			seen[key] = struct{}{}
+		}
+		results = append(results, key)
 	}
 	if err := cur.Err(); err != nil {
 		s.logger.Error("cursor error during list", zap.Error(err))
