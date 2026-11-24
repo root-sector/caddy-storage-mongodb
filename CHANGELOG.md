@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Expired certificate cleanup**: Non-recursive listings now return unique immediate child prefixes even when only deeper keys are stored, allowing CertMagic to discover issuer and site directories. Deleting a missing exact key succeeds and invalidates its cached value, so cleanup continues after removing an empty synthetic site directory. Recursive listings and lock exclusions are preserved; deletion remains limited to the exact key. Successful deletion also removes pending bulk upserts for that key under the queue lock, preventing a later flush from recreating it while preserving unrelated writes.
+
+### Changed
+
+- **Caddy compatibility**: Updated to Caddy v2.11.9 and its CertMagic v0.25.6 dependency, with the transitive versions selected by that graph. The Go requirement remains 1.26.5; MongoDB Go Driver v2.6.0 and testcontainers-go v0.42.0 are unchanged.
+
 ## [2.1.6] - 2026-06-09
 
 ### Fixed

@@ -163,6 +163,81 @@ func TestStoreLoadDeleteWithBulkWrites(t *testing.T) {
 	assert.False(t, s.Exists(ctx, TestKeyExampleKey), "Exists should return false for deleted key (bulk)")
 }
 
+func TestDeleteQueuedBulkWrites(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		stored          bool
+		cancelDelete    bool
+		concurrentFlush bool
+	}{
+		{name: "missing exact document"},
+		{name: "existing exact document", stored: true},
+		{name: "concurrent flush", concurrentFlush: true},
+		{name: "failed deletion preserves queue", stored: true, cancelDelete: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, ctx := provisionMongoDBStorage(t, false)
+			key := "queued/site.crt"
+			if tc.stored {
+				require.NoError(t, s.Store(ctx, key, []byte("original")))
+				s.cache.Wait()
+			}
+			// Exercise the real queue and Flush deterministically without a timer worker.
+			s.EnableBulkWrites = true
+			s.bulkCtx = ctx
+			s.BulkMaxOps = 100
+			s.BulkFlushInterval = time.Hour
+			s.bulkTimer = time.NewTimer(time.Hour)
+			t.Cleanup(func() { s.bulkTimer.Stop() })
+			for _, queuedKey := range []string{key, "unrelated/key", key + "/child", key} {
+				require.NoError(t, s.Store(ctx, queuedKey, []byte("queued value")))
+			}
+			require.Len(t, s.bulkQueue, 4)
+			deleteCtx := ctx
+			if tc.cancelDelete {
+				var cancel context.CancelFunc
+				deleteCtx, cancel = context.WithCancel(ctx)
+				cancel()
+			}
+			var flushErr chan error
+			if tc.concurrentFlush {
+				flushErr = make(chan error, 1)
+				go func() { flushErr <- s.Flush(ctx) }()
+			}
+			err := s.Delete(deleteCtx, key)
+			if flushErr != nil {
+				require.NoError(t, <-flushErr)
+			}
+			if tc.cancelDelete {
+				require.Error(t, err)
+				assert.Len(t, s.bulkQueue, 4, "failed deletion must preserve every pending write")
+				value, err := s.Load(ctx, key)
+				require.NoError(t, err)
+				assert.Equal(t, []byte("original"), value)
+			} else {
+				require.NoError(t, err)
+				if !tc.concurrentFlush {
+					assert.Len(t, s.bulkQueue, 2, "only exact-key pending writes should be removed")
+				}
+			}
+			require.NoError(t, s.Flush(ctx))
+			s.cache.Wait()
+			value, err := s.Load(ctx, key)
+			if tc.cancelDelete {
+				require.NoError(t, err)
+				assert.Equal(t, []byte("queued value"), value)
+			} else {
+				assert.ErrorIs(t, err, fs.ErrNotExist, "flush must not resurrect a deleted key")
+			}
+			for _, retained := range []string{"unrelated/key", key + "/child"} {
+				value, err := s.Load(ctx, retained)
+				require.NoError(t, err)
+				assert.Equal(t, []byte("queued value"), value)
+			}
+		})
+	}
+}
+
 func TestBulkWriteFlushBySize(t *testing.T) {
 	s, ctx := provisionMongoDBStorage(t, true)
 	originalBulkMaxOps := s.BulkMaxOps

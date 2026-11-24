@@ -110,10 +110,20 @@ You can also configure the storage module using environment variables:
 
 ## Building with xcaddy
 
+Current source targets Caddy v2.11.9 with CertMagic v0.25.6 and requires Go
+1.26.5 or newer. The expired-certificate cleanup fix listed under `Unreleased`
+is not included in the released v2.1.6 module used by the examples below.
+To build the current checkout, run from this repository directory:
+
+```bash
+xcaddy build v2.11.9 \
+    --with github.com/root-sector/caddy-storage-mongodb/v2="$PWD"
+```
+
 To build Caddy with the MongoDB storage module:
 
 ```bash
-xcaddy build \
+xcaddy build v2.11.9 \
     --with github.com/root-sector/caddy-storage-mongodb/v2@v2.1.6
 ```
 
@@ -128,7 +138,7 @@ otherwise `go get` and `xcaddy` will reject the tag.
 
 ```dockerfile
 # Version to build
-ARG CADDY_VERSION="2.11.4"
+ARG CADDY_VERSION="2.11.9"
 
 # Build stage
 FROM caddy:${CADDY_VERSION}-builder AS builder
@@ -154,7 +164,7 @@ RUN caddy fmt --overwrite /etc/caddy/Caddyfile
 
 ```dockerfile
 # Version to build
-ARG CADDY_VERSION="2.11.4"
+ARG CADDY_VERSION="2.11.9"
 
 # Build stage
 FROM caddy:${CADDY_VERSION}-builder AS builder

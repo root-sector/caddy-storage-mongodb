@@ -555,12 +555,31 @@ func (s *MongoDBStorage) Load(ctx context.Context, key string) ([]byte, error) {
 }
 
 func (s *MongoDBStorage) Delete(ctx context.Context, key string) error {
+	if s.EnableBulkWrites {
+		// Serialize with enqueues and flushes so an older queued Store cannot
+		// recreate the key after this Delete succeeds.
+		s.bulkMu.Lock()
+		defer s.bulkMu.Unlock()
+	}
 	opCtx, cancel := context.WithTimeout(ctx, s.Timeout)
 	defer cancel()
 	_, err := s.certCol().DeleteOne(opCtx, bson.M{"_id": key})
 	if err != nil {
 		s.logger.Error("failed to delete item", zap.String("key", key), zap.Error(err))
 		return err
+	}
+	if s.EnableBulkWrites {
+		pending := s.bulkQueue[:0]
+		for _, model := range s.bulkQueue {
+			if update, ok := model.(*mongo.UpdateOneModel); ok {
+				if filter, ok := update.Filter.(bson.M); ok && filter["_id"] == key {
+					continue
+				}
+			}
+			pending = append(pending, model)
+		}
+		clear(s.bulkQueue[len(pending):])
+		s.bulkQueue = pending
 	}
 	// CertMagic deletes empty synthetic directory keys after removing their assets.
 	// A missing exact key is already deleted; also invalidate any stale cached value.
