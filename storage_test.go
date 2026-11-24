@@ -2,9 +2,15 @@ package caddymongodb
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io/fs"
+	"math/big"
 	"os"
 	"sort"
 	"strings"
@@ -15,13 +21,14 @@ import (
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
+	"github.com/caddyserver/certmagic"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
-	// "go.uber.org/zap" // Not strictly needed here if not using zaptest directly in tests
-	// "go.uber.org/zap/zaptest" // Use if you want to pass a test-specific logger to the module
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 const (
@@ -133,7 +140,7 @@ func TestStoreLoadDelete(t *testing.T) {
 	assert.ErrorIs(t, err, fs.ErrNotExist, "Load on non-existent key should return fs.ErrNotExist")
 
 	err = s.Delete(ctx, TestKeyExampleCrt)
-	assert.ErrorIs(t, err, fs.ErrNotExist, "Delete on non-existent key should return fs.ErrNotExist")
+	assert.NoError(t, err, "Delete on non-existent key should be idempotent")
 }
 
 func TestStoreLoadDeleteWithBulkWrites(t *testing.T) {
@@ -154,6 +161,92 @@ func TestStoreLoadDeleteWithBulkWrites(t *testing.T) {
 	err = s.Delete(ctx, TestKeyExampleKey)
 	assert.NoError(t, err)
 	assert.False(t, s.Exists(ctx, TestKeyExampleKey), "Exists should return false for deleted key (bulk)")
+}
+
+func TestDeleteQueuedBulkWrites(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		stored          bool
+		cancelDelete    bool
+		concurrentFlush bool
+	}{
+		{name: "missing exact document"},
+		{name: "existing exact document", stored: true},
+		{name: "concurrent flush", concurrentFlush: true},
+		{name: "failed deletion preserves queue", stored: true, cancelDelete: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, ctx := provisionMongoDBStorage(t, false)
+			key := "queued/site.crt"
+			if tc.stored {
+				require.NoError(t, s.Store(ctx, key, []byte("original")))
+				s.cache.Wait()
+			}
+			// Exercise the real queue and Flush deterministically without a timer worker.
+			s.EnableBulkWrites = true
+			s.bulkCtx = ctx
+			s.BulkMaxOps = 100
+			s.BulkFlushInterval = time.Hour
+			s.bulkTimer = time.NewTimer(time.Hour)
+			t.Cleanup(func() { s.bulkTimer.Stop() })
+			for _, queuedKey := range []string{key, "unrelated/key", key + "/child", key} {
+				require.NoError(t, s.Store(ctx, queuedKey, []byte("queued value")))
+			}
+			require.Len(t, s.bulkQueue, 4)
+			deleteCtx := ctx
+			if tc.cancelDelete {
+				var cancel context.CancelFunc
+				deleteCtx, cancel = context.WithCancel(ctx)
+				cancel()
+			}
+			var flushErr chan error
+			if tc.concurrentFlush {
+				flushErr = make(chan error, 1)
+				go func() { flushErr <- s.Flush(ctx) }()
+			}
+			err := s.Delete(deleteCtx, key)
+			if flushErr != nil {
+				require.NoError(t, <-flushErr)
+			}
+			if tc.cancelDelete {
+				require.Error(t, err)
+				assert.Len(t, s.bulkQueue, 4, "failed deletion must preserve every pending write")
+				value, err := s.Load(ctx, key)
+				require.NoError(t, err)
+				assert.Equal(t, []byte("original"), value)
+			} else {
+				require.NoError(t, err)
+				if !tc.concurrentFlush {
+					assert.Len(t, s.bulkQueue, 2, "only exact-key pending writes should be removed")
+				}
+			}
+			require.NoError(t, s.Flush(ctx))
+			s.cache.Wait()
+			value, err := s.Load(ctx, key)
+			if tc.cancelDelete {
+				require.NoError(t, err)
+				assert.Equal(t, []byte("queued value"), value)
+			} else {
+				assert.ErrorIs(t, err, fs.ErrNotExist, "flush must not resurrect a deleted key")
+			}
+			for _, retained := range []string{"unrelated/key", key + "/child"} {
+				value, err := s.Load(ctx, retained)
+				require.NoError(t, err)
+				assert.Equal(t, []byte("queued value"), value)
+			}
+			if !tc.cancelDelete {
+				// A later Store is a new write and must survive the earlier Delete.
+				want := []byte("stored after deletion")
+				require.NoError(t, s.Store(ctx, key, want))
+				require.NoError(t, s.Flush(ctx))
+				var doc struct {
+					Value bson.Binary `bson:"value"`
+				}
+				require.NoError(t, s.certCol().FindOne(ctx, bson.M{"_id": key}).Decode(&doc))
+				assert.Equal(t, want, doc.Value.Data)
+			}
+		})
+	}
 }
 
 func TestBulkWriteFlushBySize(t *testing.T) {
@@ -238,6 +331,106 @@ func TestStat(t *testing.T) {
 	assert.False(t, infoDir.IsTerminal, "Stat on a key ending with / should not be terminal")
 }
 
+func TestDeleteMissingExactKey(t *testing.T) {
+	s, ctx := provisionMongoDBStorage(t, false)
+	parent := "certificates/issuer/site.example"
+	child := parent + "/site.example.crt"
+	require.NoError(t, s.Store(ctx, child, TestValueCrt))
+	require.NoError(t, s.Delete(ctx, parent), "synthetic prefixes have no exact document")
+	got, err := s.Load(ctx, child)
+	require.NoError(t, err)
+	assert.Equal(t, TestValueCrt, got, "deleting a missing exact key must not delete descendants")
+
+	// Another instance may have deleted a key that remains in this instance's cache.
+	s.cache.Wait()
+	_, cached := s.cache.Get(child)
+	require.True(t, cached)
+	_, err = s.certCol().DeleteOne(ctx, bson.M{"_id": child})
+	require.NoError(t, err)
+	require.NoError(t, s.Delete(ctx, child))
+	_, err = s.Load(ctx, child)
+	assert.ErrorIs(t, err, fs.ErrNotExist, "idempotent deletion must invalidate stale cache entries")
+
+	require.NoError(t, s.Store(ctx, child, TestValueCrt))
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	assert.Error(t, s.Delete(cancelled, child), "database errors must not be treated as a missing key")
+	var doc bson.M
+	require.NoError(t, s.certCol().FindOne(ctx, bson.M{"_id": child}).Decode(&doc))
+}
+
+func TestCleanStorageExpiredCertificates(t *testing.T) {
+	s, ctx := provisionMongoDBStorage(t, false)
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+	now := time.Now()
+	assets := make(map[string][]byte)
+	var expired []string
+	for i, site := range []struct {
+		issuer  string
+		name    string
+		expires time.Time
+		remove  bool
+	}{
+		{"issuer-a", "a-expired.example", now.Add(-72 * time.Hour), true},
+		{"issuer-a", "b-expired.example", now.Add(-48 * time.Hour), true},
+		{"issuer-b", "c-expired.example", now.Add(-48 * time.Hour), true},
+		{"issuer-b", "d-current.example", now.Add(24 * time.Hour), false},
+		{"issuer-b", "e-grace.example", now.Add(-time.Hour), false},
+	} {
+		cert := &x509.Certificate{
+			SerialNumber: big.NewInt(int64(i + 1)),
+			DNSNames:     []string{site.name},
+			NotBefore:    now.Add(-96 * time.Hour),
+			NotAfter:     site.expires,
+		}
+		der, err := x509.CreateCertificate(rand.Reader, cert, cert, &key.PublicKey, key)
+		require.NoError(t, err)
+		base := "certificates/" + site.issuer + "/" + site.name + "/" + site.name
+		for suffix, value := range map[string][]byte{
+			".crt":  pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}),
+			".key":  []byte("synthetic private-key placeholder"),
+			".json": []byte(`{"synthetic":true}`),
+		} {
+			asset := base + suffix
+			require.NoError(t, s.Store(ctx, asset, value))
+			if site.remove {
+				expired = append(expired, asset)
+			} else {
+				assets[asset] = value
+			}
+		}
+	}
+	assets["unrelated/keep.json"] = []byte("unrelated synthetic data")
+	require.NoError(t, s.Store(ctx, "unrelated/keep.json", assets["unrelated/keep.json"]))
+	core, logs := observer.New(zap.ErrorLevel)
+	opts := certmagic.CleanStorageOptions{
+		Logger: zap.New(core), ExpiredCerts: true, ExpiredCertGracePeriod: 24 * time.Hour,
+	}
+	for attempt := 1; attempt <= 2; attempt++ {
+		require.NoError(t, certmagic.CleanStorage(ctx, s, opts), "cleanup attempt %d", attempt)
+		// CleanStorage logs some failures instead of returning them. Check both
+		// the storage API and MongoDB directly so the cache cannot hide data loss.
+		for _, asset := range expired {
+			_, err := s.Load(ctx, asset)
+			assert.ErrorIs(t, err, fs.ErrNotExist, "expired asset remains after cleanup %d: %s", attempt, asset)
+			err = s.certCol().FindOne(ctx, bson.M{"_id": asset}).Err()
+			assert.ErrorIs(t, err, mongo.ErrNoDocuments, "expired document remains after cleanup %d: %s", attempt, asset)
+		}
+		for asset, want := range assets {
+			got, err := s.Load(ctx, asset)
+			require.NoError(t, err)
+			assert.Equal(t, want, got, "retained asset changed after cleanup %d: %s", attempt, asset)
+			var doc struct {
+				Value bson.Binary `bson:"value"`
+			}
+			require.NoError(t, s.certCol().FindOne(ctx, bson.M{"_id": asset}).Decode(&doc))
+			assert.Equal(t, want, doc.Value.Data, "retained document changed after cleanup %d: %s", attempt, asset)
+		}
+		assert.Zero(t, logs.Len(), "cleanup attempt %d logged errors", attempt)
+	}
+}
+
 func TestListRecursiveNonRecursive(t *testing.T) {
 	s, ctx := provisionMongoDBStorage(t, false)
 	keysToStore := []string{
@@ -274,11 +467,11 @@ func TestListRecursiveNonRecursive(t *testing.T) {
 	nonRecListAcme, err := s.List(ctx, TestKeyAcmePath, false)
 	require.NoError(t, err)
 	sort.Strings(nonRecListAcme)
-	assert.Equal(t, []string{directFileUnderAcme}, nonRecListAcme, "Non-recursive list for TestKeyAcmePath failed")
+	assert.Equal(t, []string{directFileUnderAcme, TestKeyExamplePath}, nonRecListAcme, "Non-recursive list for TestKeyAcmePath failed")
 
 	rootList, err := s.List(ctx, "", false)
 	require.NoError(t, err)
-	expectedRoot := []string{"toplevel.crt", "toplevel.json"}
+	expectedRoot := []string{TestKeyCertPath, "toplevel.crt", "toplevel.json"}
 	sort.Strings(rootList)
 	sort.Strings(expectedRoot)
 	assert.Equal(t, expectedRoot, rootList, "Non-recursive list for root failed")
@@ -286,6 +479,51 @@ func TestListRecursiveNonRecursive(t *testing.T) {
 	emptyList, err := s.List(ctx, "nonexistentprefix", true)
 	assert.NoError(t, err)
 	assert.Empty(t, emptyList, "List for non-existent prefix should be empty")
+
+	// Hierarchical traversal must return unique child prefixes even without markers.
+	for _, key := range []string{
+		TestKeyExamplePath, // explicit marker must not duplicate the synthetic child
+		TestKeyAcmePath + "/issue.lock",
+		"lock-only/hidden.lock", // excluded locks must not create a synthetic directory
+		"literal.+/child/grandchild.crt",
+		"literalXX/other.crt",
+	} {
+		require.NoError(t, s.Store(ctx, key, []byte("synthetic")))
+	}
+	for _, tc := range []struct {
+		prefix    string
+		recursive bool
+		want      []string
+	}{
+		{TestKeyCertPath, false, []string{TestKeyAcmePath, TestKeyCertPath + "/other-ca"}},
+		{TestKeyAcmePath, false, []string{directFileUnderAcme, TestKeyExamplePath}},
+		{"/" + TestKeyAcmePath + "/", false, []string{directFileUnderAcme, TestKeyExamplePath}},
+		{TestKeyExamplePath, false, []string{TestKeyExampleCrt, TestKeyExampleJson, TestKeyExampleKey}},
+		{"literal.+", false, []string{"literal.+/child"}},
+		{"literal.+", true, []string{"literal.+/child/grandchild.crt"}},
+		{"lock-only", false, nil},
+		{"lock-only", true, nil},
+		{"nonexistentprefix", false, nil},
+	} {
+		t.Run(fmt.Sprintf("%s/recursive=%t", tc.prefix, tc.recursive), func(t *testing.T) {
+			got, err := s.List(ctx, tc.prefix, tc.recursive)
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, got)
+		})
+	}
+	root, err := s.List(ctx, "/", false)
+	require.NoError(t, err)
+	assert.Equal(t, []string{TestKeyCertPath, "literal.+", "literalXX", "toplevel.crt", "toplevel.json"}, root)
+	all, err := s.List(ctx, "", true)
+	require.NoError(t, err)
+	wantAll := append(append([]string(nil), keysToStore...), directFileUnderAcme, TestKeyExamplePath,
+		"literal.+/child/grandchild.crt", "literalXX/other.crt")
+	sort.Strings(wantAll)
+	assert.Equal(t, wantAll, all, "recursive listing must preserve exact stored keys and exclude locks")
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	_, err = s.List(cancelled, TestKeyCertPath, false)
+	assert.Error(t, err, "database errors must not become empty successful listings")
 }
 
 func TestIndexesCreated(t *testing.T) {
