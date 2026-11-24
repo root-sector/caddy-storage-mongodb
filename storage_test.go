@@ -234,6 +234,17 @@ func TestDeleteQueuedBulkWrites(t *testing.T) {
 				require.NoError(t, err)
 				assert.Equal(t, []byte("queued value"), value)
 			}
+			if !tc.cancelDelete {
+				// A later Store is a new write and must survive the earlier Delete.
+				want := []byte("stored after deletion")
+				require.NoError(t, s.Store(ctx, key, want))
+				require.NoError(t, s.Flush(ctx))
+				var doc struct {
+					Value bson.Binary `bson:"value"`
+				}
+				require.NoError(t, s.certCol().FindOne(ctx, bson.M{"_id": key}).Decode(&doc))
+				assert.Equal(t, want, doc.Value.Data)
+			}
 		})
 	}
 }
@@ -396,20 +407,28 @@ func TestCleanStorageExpiredCertificates(t *testing.T) {
 	opts := certmagic.CleanStorageOptions{
 		Logger: zap.New(core), ExpiredCerts: true, ExpiredCertGracePeriod: 24 * time.Hour,
 	}
-	require.NoError(t, certmagic.CleanStorage(ctx, s, opts))
-	// CleanStorage logs some failures instead of returning them. Verify real effects.
-	for _, asset := range expired {
-		_, err := s.Load(ctx, asset)
-		assert.ErrorIs(t, err, fs.ErrNotExist, "expired asset remains: %s", asset)
+	for attempt := 1; attempt <= 2; attempt++ {
+		require.NoError(t, certmagic.CleanStorage(ctx, s, opts), "cleanup attempt %d", attempt)
+		// CleanStorage logs some failures instead of returning them. Check both
+		// the storage API and MongoDB directly so the cache cannot hide data loss.
+		for _, asset := range expired {
+			_, err := s.Load(ctx, asset)
+			assert.ErrorIs(t, err, fs.ErrNotExist, "expired asset remains after cleanup %d: %s", attempt, asset)
+			err = s.certCol().FindOne(ctx, bson.M{"_id": asset}).Err()
+			assert.ErrorIs(t, err, mongo.ErrNoDocuments, "expired document remains after cleanup %d: %s", attempt, asset)
+		}
+		for asset, want := range assets {
+			got, err := s.Load(ctx, asset)
+			require.NoError(t, err)
+			assert.Equal(t, want, got, "retained asset changed after cleanup %d: %s", attempt, asset)
+			var doc struct {
+				Value bson.Binary `bson:"value"`
+			}
+			require.NoError(t, s.certCol().FindOne(ctx, bson.M{"_id": asset}).Decode(&doc))
+			assert.Equal(t, want, doc.Value.Data, "retained document changed after cleanup %d: %s", attempt, asset)
+		}
+		assert.Zero(t, logs.Len(), "cleanup attempt %d logged errors", attempt)
 	}
-	for asset, want := range assets {
-		got, err := s.Load(ctx, asset)
-		require.NoError(t, err)
-		assert.Equal(t, want, got, "retained asset changed: %s", asset)
-	}
-	assert.Zero(t, logs.Len(), "cleanup logged errors")
-	require.NoError(t, certmagic.CleanStorage(ctx, s, opts), "repeat cleanup must remain safe")
-	assert.Zero(t, logs.Len(), "repeat cleanup logged errors")
 }
 
 func TestListRecursiveNonRecursive(t *testing.T) {
